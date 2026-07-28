@@ -143,6 +143,10 @@ class CombustionCard extends HTMLElement {
 
   getCardSize() { return this._round ? 5 : 4; }
 
+  disconnectedCallback() {
+    if (this._targetTimer) { clearTimeout(this._targetTimer); this._targetTimer = null; }
+  }
+
   set hass(hass) {
     this._hass = hass;
     if (!this.shadowRoot) this._render(this.attachShadow({ mode: 'open' }));
@@ -220,14 +224,52 @@ class CombustionCard extends HTMLElement {
     };
   }
 
+  // Stepping the target optimistically accumulates into a pending value and
+  // debounces the actual service call. Writes go over a slow BLE connection, so
+  // reading back state per click would (a) lag and (b) lose rapid clicks (they
+  // would all read the same stale state). Instead we track the pending target
+  // locally, show it immediately, and send only the final value once clicking
+  // settles. The pending value is cleared when real state catches up.
   _stepTarget(dir) {
     const st = this._state('target');
     if (!st || !this._hass) return;
     const { min, max, step } = this._targetLimits();
-    const cur = Number(st.state);
-    const base = Number.isFinite(cur) ? cur : min;
+    let base = this._pendingTarget;
+    if (base === null || base === undefined) {
+      const cur = Number(st.state);
+      base = Number.isFinite(cur) ? cur : min;
+    }
+    // Round to the step grid so accumulated clicks stay aligned.
     const next = Math.max(min, Math.min(max, base + dir * step));
-    this._hass.callService('number', 'set_value', { entity_id: this._entities.target, value: next });
+    this._pendingTarget = Math.round(next / step) * step;
+    this._renderTarget();
+
+    if (this._targetTimer) clearTimeout(this._targetTimer);
+    this._targetTimer = setTimeout(() => {
+      this._targetTimer = null;
+      const value = this._pendingTarget;
+      if (value === null || value === undefined || !this._hass) return;
+      this._hass.callService('number', 'set_value', {
+        entity_id: this._entities.target, value,
+      });
+      // Keep showing the pending value until HA reports a state at/near it, so
+      // the display doesn't briefly snap back to the pre-write value.
+    }, 450);
+  }
+
+  _unit() {
+    const core = this._state('core');
+    return (core && core.attributes.unit_of_measurement) || '°C';
+  }
+
+  // Update just the target segment, preferring the optimistic pending value.
+  _renderTarget() {
+    if (!this.shadowRoot || !this._hass) return;
+    const st = this._state('target');
+    const shown = (this._pendingTarget !== null && this._pendingTarget !== undefined)
+      ? this._pendingTarget
+      : this._num('target');
+    if (st) this._setSeg('tgt', this._fmt(shown, 1), 'tgt-unit', this._unit());
   }
 
   // ---- shared LCD chrome ----
@@ -501,7 +543,15 @@ class CombustionCard extends HTMLElement {
         const targetSt = this._state('target');
         targetBar.classList.toggle('show', !!targetSt);
         if (targetSt) {
-          this._setSeg('tgt', this._fmt(this._num('target'), 1), 'tgt-unit', unit);
+          // Once real state reaches the pending value (and no write is queued),
+          // drop the optimistic override so the entity is the source of truth.
+          const real = this._num('target');
+          const pending = this._pendingTarget;
+          if (pending !== null && pending !== undefined && !this._targetTimer
+              && real !== null && Math.abs(real - pending) < 0.05) {
+            this._pendingTarget = null;
+          }
+          this._renderTarget();
         }
       }
     }
