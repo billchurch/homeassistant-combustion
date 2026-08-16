@@ -72,6 +72,7 @@ async def test_gauge_discovery_creates_entry(hass: HomeAssistant):
 async def test_user_step_finds_discovered_device(hass: HomeAssistant):
     """The manual (user) flow should adopt a device already seen by discovery."""
     inject_bt_advertisement(hass, create_advertisement(gauge_payload()))
+    await hass.async_block_till_done()
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": config_entries.SOURCE_USER}
     )
