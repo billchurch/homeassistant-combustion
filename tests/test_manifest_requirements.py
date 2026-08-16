@@ -55,6 +55,7 @@ def _declared() -> set[str]:
 
 
 def test_no_undeclared_third_party_imports():
+    """Fail if the package imports a package nothing installs for it."""
     undeclared = (
         _top_level_imports() - sys.stdlib_module_names - ALWAYS_OK - _declared()
     )
