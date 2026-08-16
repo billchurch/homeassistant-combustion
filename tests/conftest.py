@@ -23,8 +23,35 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 pytest_plugins = "pytest_homeassistant_custom_component"
 
+@pytest.fixture(autouse=True, scope="session")
+def _mock_bt_history():
+    """Stub BlueZ history: it calls into dbus_fast, absent on non-Linux dev boxes."""
+    with patch("bluetooth_adapters.systems.linux.LinuxAdapters.history", {}):
+        yield
+
 @pytest.fixture(autouse=True)
-def mock_bluetooth(enable_bluetooth):
+def _mock_ha_scanner(mock_bleak_scanner_start):
+    """Make the mocked HaScanner reach the binding bluetooth's setup actually uses.
+
+    homeassistant.components.bluetooth does `from habluetooth import HaScanner`, a
+    separate binding from `habluetooth.scanner.HaScanner`, which is what
+    pytest_homeassistant_custom_component's `mock_bleak_scanner_start` fixture
+    patches. Left unpatched, `enable_bluetooth`'s own "bluetooth" config entry
+    setup constructs a real HaScanner -> BleakScanner, which selects a backend
+    via the *unpatched* stdlib `platform.system()` (mock_bluetooth_adapters only
+    patches `bluetooth_adapters.systems.platform`, a distinct reference) and
+    reaches for dbus_fast, absent on non-Linux dev boxes. The resulting
+    ConfigEntryNotReady is swallowed by config_entries, but BaseHaScanner already
+    scheduled its expiry timer in HaScanner.async_setup(), so it lingers past
+    teardown and fails pytest_homeassistant_custom_component's verify_cleanup.
+    """
+    import habluetooth.scanner as bluetooth_scanner  # noqa: PLC0415
+
+    with patch("homeassistant.components.bluetooth.HaScanner", bluetooth_scanner.HaScanner):
+        yield
+
+@pytest.fixture(autouse=True)
+def mock_bluetooth(_mock_bt_history, mock_bluetooth_adapters, _mock_ha_scanner, enable_bluetooth):
     """Auto mock bluetooth."""
 
 # This fixture enables loading custom integrations in all tests.

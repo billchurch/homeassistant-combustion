@@ -58,6 +58,27 @@ async def test_entity_creation(hass: HomeAssistant):
     assert len(disabled_sensors) == 9
     assert len(binary_sensors) == 2
 
+@pytest.mark.asyncio
+async def test_probe_advertisement_creates_entities(hass: HomeAssistant):
+    """A single probe advertisement must produce the full entity set."""
+    entry = MockConfigEntry(
+        domain=DOMAIN, version=1, data={}, title="Meatnet",
+        unique_id="combustion_meatnet",
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    inject_bt_advertisement(hass, create_advertisement(create_combustion_bits()))
+    await hass.async_block_till_done()
+
+    reg = entity_registry.async_get(hass)
+    entities = entity_registry.async_entries_for_config_entry(reg, entry.entry_id)
+    assert len(entities) == 16
+
+    core = hass.states.get("sensor.predictive_thermometer_cc1c0010_core_temperature")
+    assert core is not None
+    assert core.state == "20.0"
 
 @pytest.mark.asyncio
 async def test_entity_creation_non_connectable(hass: HomeAssistant):
