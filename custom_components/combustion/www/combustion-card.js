@@ -38,6 +38,160 @@ const DSEG7_B64 = "d09GMgABAAAAABQMAA4AAAAAWgAAABOxAAEAAAAAAAAAAAAAAAAAAAAAAAAAA
 
 const PROBE_SERIAL_RE = /^[0-9a-f]{8}$/;
 
+// ---- Entity resolution (device-registry based) ----
+//
+// Maps entity-ID suffixes to card entity roles. A role's kind is 'probe',
+// 'gauge', or 'both' (applies either way). Entries are sorted by suffix
+// length, longest first, so a more specific suffix always wins — e.g. a
+// probe's `_core_temperature` entity is never mistaken for a gauge's plain
+// `_temperature` reading just because `_core_temperature` also happens to
+// end in `_temperature`.
+const ROLE_SUFFIXES = [
+  ['core', '_core_temperature', 'probe'],
+  ['ambient', '_ambient_temperature', 'probe'],
+  ['instant', '_instant_read_temperature', 'probe'],
+  ['mode', '_mode', 'probe'],
+  ['ready_in', '_ready_in', 'probe'],
+  ['cook_target', '_cook_target', 'probe'],
+  ['prediction', '_prediction', 'probe'],
+  ['target', '_target_temperature', 'probe'],
+  ['battery', '_battery', 'both'],
+  ['overheating', '_overheating', 'both'],
+  ['core', '_temperature', 'gauge'],
+  ['sensor_connected', '_sensor_connected', 'gauge'],
+  ['high_alarm', '_high_alarm', 'gauge'],
+  ['low_alarm', '_low_alarm', 'gauge'],
+].sort((a, b) => b[1].length - a[1].length);
+
+function deviceIdForEntity(hass, entityId) {
+  const reg = hass && hass.entities && hass.entities[entityId];
+  return (reg && reg.device_id) || null;
+}
+
+// Legacy seed: find the device whose `identifiers` contain ["combustion", serial].
+function deviceIdForSerial(hass, serial) {
+  const devices = (hass && hass.devices) || {};
+  for (const dev of Object.values(devices)) {
+    const idents = dev && dev.identifiers;
+    if (!Array.isArray(idents)) continue;
+    for (const ident of idents) {
+      if (Array.isArray(ident) && ident[0] === 'combustion' && String(ident[1]).toLowerCase() === serial) {
+        return dev.id;
+      }
+    }
+  }
+  return null;
+}
+
+function siblingEntityIds(hass, deviceId) {
+  const entities = (hass && hass.entities) || {};
+  return Object.keys(entities).filter((id) => entities[id] && entities[id].device_id === deviceId);
+}
+
+// Assign every sibling entity to a card role. Each entity is matched against
+// its single most specific suffix across *all* roles (ROLE_SUFFIXES is
+// sorted longest-first, so `.find` returns that one), THEN filtered to
+// `kind` ('gauge' or 'probe'; 'both' always applies). Determining the best
+// match before filtering by kind is what keeps a `_core_temperature` entity
+// from being claimed by a gauge's generic `_temperature` rule — its best
+// match is the longer, probe-only suffix, which the kind filter then
+// rejects, regardless of which entity happens to come first in the list.
+// A role with no matching sibling is simply absent — do not invent one.
+function assignRoles(siblingIds, kind) {
+  const entities = {};
+  for (const id of siblingIds) {
+    const best = ROLE_SUFFIXES.find(([, suffix]) => id.endsWith(suffix));
+    if (!best) continue;
+    const [role, , roleKind] = best;
+    if (roleKind !== 'both' && roleKind !== kind) continue;
+    if (entities[role] !== undefined) continue;
+    entities[role] = id;
+  }
+  return entities;
+}
+
+// The original serial-concatenation guess, kept verbatim as the fallback for
+// when the registry has no matching device (e.g. not yet populated).
+function legacyStringBuild(serial, isGauge) {
+  const base = (isGauge ? 'grill_gauge_' : 'predictive_thermometer_') + serial;
+  return isGauge ? {
+    core: 'sensor.' + base + '_temperature',
+    sensor_connected: 'binary_sensor.' + base + '_sensor_connected',
+    overheating: 'binary_sensor.' + base + '_overheating',
+    high_alarm: 'binary_sensor.' + base + '_high_alarm',
+    low_alarm: 'binary_sensor.' + base + '_low_alarm',
+    battery: 'binary_sensor.' + base + '_battery',
+  } : {
+    core: 'sensor.' + base + '_core_temperature',
+    ambient: 'sensor.' + base + '_ambient_temperature',
+    instant: 'sensor.' + base + '_instant_read_temperature',
+    overheating: 'binary_sensor.' + base + '_overheating',
+    battery: 'binary_sensor.' + base + '_battery',
+    mode: 'sensor.' + base + '_mode',
+    ready_in: 'sensor.' + base + '_ready_in',
+    cook_target: 'sensor.' + base + '_cook_target',
+    prediction: 'sensor.' + base + '_prediction',
+    target: 'number.' + base + '_target_temperature',
+  };
+}
+
+/**
+ * Resolve a card config into `{ isGauge, entities }`.
+ *
+ * Seeded two ways (checked in order): `entity:` — the device_id of the
+ * picked entity — or legacy `serial:` — the device whose `identifiers`
+ * contain ["combustion", serial]. Either way, once a device is found, every
+ * sibling entity on it is assigned to a role by entity-ID suffix, which
+ * survives a device rename (the entity's own name, not the device's).
+ *
+ * Probe vs gauge is a capability question, not a guess from serial shape: a
+ * device with a `_zone` sibling is a gauge, otherwise it's a probe. An
+ * explicit `kind:` in config always overrides this.
+ *
+ * If no device is found (registry not populated yet, or a legacy `serial:`
+ * for an install where identifiers don't resolve), falls back to the
+ * original string-building guess unchanged.
+ *
+ * `config.entities` overrides always win over anything resolved here.
+ *
+ * Pure function — no DOM, no `this` — so it's directly unit-testable.
+ */
+export function resolveEntities(config, hass) {
+  const serial = (config.serial || '').toLowerCase();
+  let deviceId = null;
+
+  if (config.entity) {
+    deviceId = deviceIdForEntity(hass, config.entity);
+  }
+  if (!deviceId && serial) {
+    deviceId = deviceIdForSerial(hass, serial);
+  }
+
+  let isGauge;
+  let entities;
+
+  if (deviceId) {
+    const siblingIds = siblingEntityIds(hass, deviceId);
+    const hasZone = siblingIds.some((id) => id.endsWith('_zone'));
+    isGauge = config.kind ? config.kind === 'gauge' : hasZone;
+    entities = assignRoles(siblingIds, isGauge ? 'gauge' : 'probe');
+  } else {
+    let fallbackSerial = serial;
+    if (!fallbackSerial && config.entity) {
+      const m = config.entity.match(/^(?:sensor|binary_sensor)\.(?:predictive_thermometer|grill_gauge)_([0-9a-z]+)_/);
+      if (m) fallbackSerial = m[1];
+    }
+    isGauge = config.kind ? config.kind === 'gauge' : !PROBE_SERIAL_RE.test(fallbackSerial);
+    entities = legacyStringBuild(fallbackSerial, isGauge);
+  }
+
+  const overrides = Object.assign({}, config.entities || {});
+  if (overrides.temperature && isGauge) overrides.core = overrides.temperature;
+  Object.assign(entities, overrides);
+
+  return { isGauge, entities };
+}
+
 // The dial is a 0–1000 °F scale drawn as 31 evenly-spaced ticks. Each zone is
 // a temperature RANGE in °C (tune these freely). The grill-zone sensor in the
 // integration uses the same boundaries — keep the two in sync.
@@ -81,47 +235,33 @@ class CombustionCard extends HTMLElement {
   }
 
   setConfig(config) {
-    let serial = (config.serial || '').toLowerCase();
-    if (!serial && config.entity) {
-      const m = config.entity.match(/^(?:sensor|binary_sensor)\.(?:predictive_thermometer|grill_gauge)_([0-9a-z]+)_/);
-      if (m) serial = m[1];
-    }
-    if (!serial && !(config.entities && (config.entities.core || config.entities.temperature))) {
+    const serial = (config.serial || '').toLowerCase();
+    if (!serial && !config.entity && !(config.entities && (config.entities.core || config.entities.temperature))) {
       throw new Error('combustion-card: set "serial" or "entity" (any entity of the probe/gauge)');
     }
 
     this._config = config;
-    this._isGauge = config.kind ? config.kind === 'gauge' : !PROBE_SERIAL_RE.test(serial);
-    this._round = this._isGauge && config.style !== 'square';
 
-    const base = (this._isGauge ? 'grill_gauge_' : 'predictive_thermometer_') + serial;
-    const defaults = this._isGauge ? {
-      core: 'sensor.' + base + '_temperature',
-      sensor_connected: 'binary_sensor.' + base + '_sensor_connected',
-      overheating: 'binary_sensor.' + base + '_overheating',
-      high_alarm: 'binary_sensor.' + base + '_high_alarm',
-      low_alarm: 'binary_sensor.' + base + '_low_alarm',
-      battery: 'binary_sensor.' + base + '_battery',
-    } : {
-      core: 'sensor.' + base + '_core_temperature',
-      ambient: 'sensor.' + base + '_ambient_temperature',
-      instant: 'sensor.' + base + '_instant_read_temperature',
-      overheating: 'binary_sensor.' + base + '_overheating',
-      battery: 'binary_sensor.' + base + '_battery',
-      mode: 'sensor.' + base + '_mode',
-      ready_in: 'sensor.' + base + '_ready_in',
-      cook_target: 'sensor.' + base + '_cook_target',
-      prediction: 'sensor.' + base + '_prediction',
-      target: 'number.' + base + '_target_temperature',
-    };
-    const overrides = Object.assign({}, config.entities || {});
-    if (overrides.temperature && this._isGauge) overrides.core = overrides.temperature;
-    this._entities = Object.assign(defaults, overrides);
+    // Resolution needs the device/entity registry, which only arrives with
+    // `hass` — and setConfig runs *before* hass is set on first add. Defer:
+    // resolve lazily the next time `hass` is written and cache the result,
+    // so we neither string-build blind here nor re-resolve on every hass
+    // update (that setter fires constantly).
+    this._resolved = false;
+    if (this._hass) this._resolve();
 
     this._secondary = this._resolveSecondary(config.secondary);
     this._secondaryIndex = 0;
 
     if (this.shadowRoot) { this.shadowRoot.innerHTML = ''; this._render(this.shadowRoot); }
+  }
+
+  _resolve() {
+    const { isGauge, entities } = resolveEntities(this._config, this._hass);
+    this._isGauge = isGauge;
+    this._round = this._isGauge && this._config.style !== 'square';
+    this._entities = entities;
+    this._resolved = true;
   }
 
   _resolveSecondary(sec) {
@@ -149,6 +289,7 @@ class CombustionCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    if (!this._resolved) this._resolve();
     if (!this.shadowRoot) this._render(this.attachShadow({ mode: 'open' }));
     this._update();
   }
@@ -808,9 +949,13 @@ class CombustionCardEditor extends HTMLElement {
   }
 
   set hass(hass) {
-    // The form does not depend on hass; do NOT re-render here, or frequent hass
-    // updates would wipe the serial field while the user is typing into it.
+    // The form does not depend on hass for its plain fields; do NOT re-render
+    // here, or frequent hass updates would wipe the serial field while the
+    // user is typing into it. The entity picker (if present) does need a
+    // live hass to look up entities, so push it through directly instead.
     this._hass = hass;
+    const picker = this.shadowRoot && this.shadowRoot.getElementById('entity-picker');
+    if (picker) picker.hass = hass;
   }
 
   connectedCallback() {
@@ -821,10 +966,47 @@ class CombustionCardEditor extends HTMLElement {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  // Entities selectable from the picker: combustion-platform sensors whose ID
+  // ends `_core_temperature` (probes) or `_zone`/`_temperature` (gauges).
+  // This is what keeps Boosters and Displays from being picked at all — they
+  // have neither suffix. Guard against the same greedy-suffix trap as the
+  // resolver: `_ambient_temperature` etc. also end in `_temperature`.
+  _pickerFilter(stateObj) {
+    const id = stateObj.entity_id;
+    const reg = this._hass && this._hass.entities && this._hass.entities[id];
+    if (reg && reg.platform && reg.platform !== 'combustion') return false;
+    if (id.endsWith('_core_temperature') || id.endsWith('_zone')) return true;
+    return id.endsWith('_temperature')
+      && !id.endsWith('_ambient_temperature')
+      && !id.endsWith('_instant_read_temperature')
+      && !id.endsWith('_target_temperature');
+  }
+
+  // If ha-entity-picker isn't registered yet (editor rendered very early, or
+  // outside a full frontend), fall back to the plain serial field instead of
+  // showing a dead custom element. Re-render once it becomes available.
+  _ensurePickerUpgrade() {
+    if (customElements.get('ha-entity-picker') || this._pickerUpgradeQueued) return;
+    this._pickerUpgradeQueued = true;
+    customElements.whenDefined('ha-entity-picker').then(() => {
+      this._pickerUpgradeQueued = false;
+      if (this.isConnected) this._render();
+    }).catch(() => { this._pickerUpgradeQueued = false; });
+  }
+
   _render() {
     if (!this._config) return;
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     const cfg = this._config;
+    const hasPicker = typeof customElements !== 'undefined' && !!customElements.get('ha-entity-picker');
+    if (!hasPicker) this._ensurePickerUpgrade();
+
+    const pickerRow = hasPicker ? `
+        <div class="row">
+          <label id="entity-picker-label">Probe or gauge</label>
+          <div id="entity-picker-slot"></div>
+          <span class="hint">Pick the probe or gauge to show. Boosters and Displays aren't selectable here.</span>
+        </div>` : '';
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -844,15 +1026,16 @@ class CombustionCardEditor extends HTMLElement {
         .hint { font-size: 12px; color: var(--secondary-text-color, #727272); }
       </style>
       <div class="form">
+        ${pickerRow}
         <div class="row">
-          <label for="serial">Serial</label>
+          <label for="serial">${hasPicker ? 'Or enter a serial' : 'Serial'}</label>
           <input id="serial" type="text" value="${cfg.serial ? this._esc(cfg.serial) : ''}" placeholder="e.g. 10007dc0 or G000000123" />
-          <span class="hint">Probe serial (8 hex chars) or gauge serial. Leave blank if using an "entity" or "entities" override in YAML.</span>
+          <span class="hint">Probe serial (8 hex chars) or gauge serial. Leave blank if using the picker above, or an "entity"/"entities" override in YAML.</span>
         </div>
         <div class="row">
           <label for="kind">Kind</label>
           <select id="kind">
-            <option value="" ${!cfg.kind ? 'selected' : ''}>Auto (detect from serial)</option>
+            <option value="" ${!cfg.kind ? 'selected' : ''}>Auto (detect from device)</option>
             <option value="probe" ${cfg.kind === 'probe' ? 'selected' : ''}>Probe</option>
             <option value="gauge" ${cfg.kind === 'gauge' ? 'selected' : ''}>Giant Grill Gauge</option>
           </select>
@@ -868,6 +1051,22 @@ class CombustionCardEditor extends HTMLElement {
         </div>
       </div>
     `;
+
+    if (hasPicker) {
+      const slot = this.shadowRoot.getElementById('entity-picker-slot');
+      const picker = document.createElement('ha-entity-picker');
+      picker.id = 'entity-picker';
+      picker.hass = this._hass;
+      picker.value = cfg.entity || '';
+      picker.label = 'Entity';
+      picker.allowCustomEntity = false;
+      picker.entityFilter = (stateObj) => this._pickerFilter(stateObj);
+      picker.addEventListener('value-changed', (ev) => {
+        ev.stopPropagation();
+        this._update('entity', (ev.detail && ev.detail.value) || '');
+      });
+      slot.appendChild(picker);
+    }
 
     this.shadowRoot.getElementById('serial').addEventListener('change', (ev) => this._update('serial', ev.target.value.trim()));
     this.shadowRoot.getElementById('kind').addEventListener('change', (ev) => this._update('kind', ev.target.value));
