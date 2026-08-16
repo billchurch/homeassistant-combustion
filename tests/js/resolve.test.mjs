@@ -21,7 +21,12 @@ globalThis.document = {
 // to the resolver under test); Node has no `window` global, so provide one.
 globalThis.window = globalThis;
 
-const { resolveEntities } = await import('../../custom_components/combustion/www/combustion-card.js');
+const {
+  resolveEntities,
+  hasPopulatedRegistry,
+  computeGaugeDeviceIds,
+  isPickableCombustionEntity,
+} = await import('../../custom_components/combustion/www/combustion-card.js');
 
 // ---- fixture helpers ----
 //
@@ -257,4 +262,75 @@ test('a device missing an optional entity leaves that role undefined rather than
   // guessed "sensor.predictive_thermometer_partial1_prediction" instead of
   // undefined — the current code must leave absent siblings unassigned, not
   // invent a placeholder ID.
+});
+
+test('select.<probe>_power_mode does not collide with sensor.<probe>_mode, in either registry order', () => {
+  // Both entities live on the same probe device and both end in `_mode`
+  // ("...power_mode" and "...mode"). Only the domain prefix ("select." vs
+  // "sensor.") tells them apart — a suffix-only match would pick whichever
+  // one Object.keys(hass.entities) happens to list first, which is registry
+  // insertion order, not anything meaningful. Pin both orders explicitly so
+  // this can't pass by luck.
+  const device = { id: 'device-collide', identifiers: [['combustion', 'collide1']] };
+  const modeSensor = 'sensor.collide_mode';
+  const powerModeSelect = 'select.collide_power_mode';
+  const coreEntity = 'sensor.collide_core_temperature';
+
+  for (const order of [
+    [coreEntity, modeSensor, powerModeSelect],
+    [coreEntity, powerModeSelect, modeSensor],
+  ]) {
+    const hass = makeHass([device], { 'device-collide': order });
+    const { entities } = resolveEntities({ entity: coreEntity }, hass);
+
+    assert.equal(entities.mode, modeSensor, `order ${JSON.stringify(order)}`);
+    assert.notEqual(entities.mode, powerModeSelect, `order ${JSON.stringify(order)}`);
+  }
+  // Revert check: drop the domain field from ROLE_SUFFIXES / assignRoles
+  // (match by suffix alone, as the first implementation did) and this fails
+  // on the `[coreEntity, powerModeSelect, modeSensor]` order — the select
+  // entity is encountered first, also ends in `_mode`, and wins the role
+  // before the real sensor is ever considered.
+});
+
+test('hasPopulatedRegistry: false for an empty or missing hass.entities, true once populated', () => {
+  assert.equal(hasPopulatedRegistry(undefined), false);
+  assert.equal(hasPopulatedRegistry({}), false);
+  assert.equal(hasPopulatedRegistry({ entities: {} }), false);
+  assert.equal(hasPopulatedRegistry({ entities: { 'sensor.x': {} } }), true);
+  // Revert check: hardcode this to `return true;` (equivalent to the
+  // pre-fix behaviour, where CombustionCard cached whatever the very first
+  // `hass` write produced even off an empty registry) and the first three
+  // assertions fail.
+});
+
+test('the editor picker filter excludes a probe\'s _surface_temperature reading', () => {
+  // Real entities: a gauge device (core temperature + zone) and a probe
+  // device that additionally exposes a virtual "Surface Temperature"
+  // sensor — a real, shipped entity (see sensor.py CombustionVirtualSurfaceSensor)
+  // that also happens to end in `_temperature`, same as the gauge's core
+  // reading. A denylist-based filter has to know to exclude this suffix by
+  // name; a capability check does not.
+  const gaugeDevice = { id: 'device-pit', identifiers: [['combustion', 'g1']] };
+  const probeDevice = { id: 'device-brisket', identifiers: [['combustion', 'p1']] };
+  const hass = makeHass([gaugeDevice, probeDevice], {
+    'device-pit': ['sensor.pit_temperature', 'sensor.pit_zone'],
+    'device-brisket': ['sensor.brisket_core_temperature', 'sensor.brisket_surface_temperature'],
+  });
+
+  const gaugeIds = computeGaugeDeviceIds(hass);
+  assert.equal(gaugeIds.has('device-pit'), true);
+  assert.equal(gaugeIds.has('device-brisket'), false);
+
+  const pick = (entityId) => isPickableCombustionEntity(entityId, hass.entities[entityId], gaugeIds);
+
+  assert.equal(pick('sensor.pit_temperature'), true); // gauge core -> pickable
+  assert.equal(pick('sensor.pit_zone'), true); // gauge zone -> pickable
+  assert.equal(pick('sensor.brisket_core_temperature'), true); // probe core -> pickable
+  assert.equal(pick('sensor.brisket_surface_temperature'), false); // probe secondary reading -> NOT pickable
+  // Revert check: restore the original denylist implementation
+  // (`id.endsWith('_temperature') && !id.endsWith('_ambient_temperature') &&
+  // !id.endsWith('_instant_read_temperature') && !id.endsWith('_target_temperature')`)
+  // and the last assertion fails — `_surface_temperature` isn't on that
+  // denylist, so it's (wrongly) treated as pickable.
 });

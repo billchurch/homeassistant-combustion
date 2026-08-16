@@ -40,28 +40,38 @@ const PROBE_SERIAL_RE = /^[0-9a-f]{8}$/;
 
 // ---- Entity resolution (device-registry based) ----
 //
-// Maps entity-ID suffixes to card entity roles. A role's kind is 'probe',
-// 'gauge', or 'both' (applies either way). Entries are sorted by suffix
-// length, longest first, so a more specific suffix always wins — e.g. a
-// probe's `_core_temperature` entity is never mistaken for a gauge's plain
-// `_temperature` reading just because `_core_temperature` also happens to
-// end in `_temperature`.
+// Maps entity-ID (domain + suffix) to card entity roles. A role's kind is
+// 'probe', 'gauge', or 'both' (applies either way). The domain matters: the
+// power-mode select (`select.<device>_power_mode`) lives on the same device
+// as the mode sensor (`sensor.<device>_mode`) and also ends in `_mode` —
+// without a domain check the two would compete for the 'mode' role, with
+// the winner decided by hass.entities key order (registry insertion
+// order), not anything meaningful. Entries are sorted by suffix length,
+// longest first, so a more specific suffix always wins within a domain —
+// e.g. a probe's `_core_temperature` entity is never mistaken for a
+// gauge's plain `_temperature` reading just because `_core_temperature`
+// also happens to end in `_temperature`.
+//
+// Adding a new role: any suffix ending in `_temperature` that isn't listed
+// here falls through to the generic gauge `_temperature` rule and will tie
+// with it on a gauge device — the domain check alone won't save you from
+// that, only an explicit entry will.
 const ROLE_SUFFIXES = [
-  ['core', '_core_temperature', 'probe'],
-  ['ambient', '_ambient_temperature', 'probe'],
-  ['instant', '_instant_read_temperature', 'probe'],
-  ['mode', '_mode', 'probe'],
-  ['ready_in', '_ready_in', 'probe'],
-  ['cook_target', '_cook_target', 'probe'],
-  ['prediction', '_prediction', 'probe'],
-  ['target', '_target_temperature', 'probe'],
-  ['battery', '_battery', 'both'],
-  ['overheating', '_overheating', 'both'],
-  ['core', '_temperature', 'gauge'],
-  ['sensor_connected', '_sensor_connected', 'gauge'],
-  ['high_alarm', '_high_alarm', 'gauge'],
-  ['low_alarm', '_low_alarm', 'gauge'],
-].sort((a, b) => b[1].length - a[1].length);
+  ['core', 'sensor.', '_core_temperature', 'probe'],
+  ['ambient', 'sensor.', '_ambient_temperature', 'probe'],
+  ['instant', 'sensor.', '_instant_read_temperature', 'probe'],
+  ['mode', 'sensor.', '_mode', 'probe'],
+  ['ready_in', 'sensor.', '_ready_in', 'probe'],
+  ['cook_target', 'sensor.', '_cook_target', 'probe'],
+  ['prediction', 'sensor.', '_prediction', 'probe'],
+  ['target', 'number.', '_target_temperature', 'probe'],
+  ['battery', 'binary_sensor.', '_battery', 'both'],
+  ['overheating', 'binary_sensor.', '_overheating', 'both'],
+  ['core', 'sensor.', '_temperature', 'gauge'],
+  ['sensor_connected', 'binary_sensor.', '_sensor_connected', 'gauge'],
+  ['high_alarm', 'binary_sensor.', '_high_alarm', 'gauge'],
+  ['low_alarm', 'binary_sensor.', '_low_alarm', 'gauge'],
+].sort((a, b) => b[2].length - a[2].length);
 
 function deviceIdForEntity(hass, entityId) {
   const reg = hass && hass.entities && hass.entities[entityId];
@@ -88,6 +98,49 @@ function siblingEntityIds(hass, deviceId) {
   return Object.keys(entities).filter((id) => entities[id] && entities[id].device_id === deviceId);
 }
 
+// Every device_id that has at least one `_zone` sibling — the same
+// capability signal `resolveEntities` uses to decide gauge vs probe. Shared
+// with the editor's entity-picker filter so the two agree by construction
+// instead of the picker keeping its own separate (and previously
+// incomplete) idea of what a "gauge temperature" entity looks like.
+export function computeGaugeDeviceIds(hass) {
+  const entities = (hass && hass.entities) || {};
+  const ids = new Set();
+  for (const id of Object.keys(entities)) {
+    const reg = entities[id];
+    if (id.endsWith('_zone') && reg && reg.device_id) ids.add(reg.device_id);
+  }
+  return ids;
+}
+
+// Is this entity something the editor's picker should offer, to identify a
+// probe or gauge? A capability check (is this entity's device a gauge, per
+// computeGaugeDeviceIds) rather than a denylist of known non-core suffixes —
+// a denylist has to be kept in sync by hand and silently admits any
+// `*_temperature` suffix nobody thought to exclude (a probe's own
+// `_surface_temperature` reading did exactly this). `reg` is the entity's
+// hass.entities registry entry, if any; `gaugeDeviceIds` is a Set from
+// computeGaugeDeviceIds. Pure — no DOM, no `this` — so it's independently
+// unit-testable; the editor's `_pickerFilter` is a thin wrapper supplying
+// live registry data.
+export function isPickableCombustionEntity(entityId, reg, gaugeDeviceIds) {
+  if (!reg || reg.platform !== 'combustion') return false;
+  if (entityId.endsWith('_core_temperature') || entityId.endsWith('_zone')) return true;
+  if (!entityId.endsWith('_temperature')) return false;
+  return !!(gaugeDeviceIds && gaugeDeviceIds.has(reg.device_id));
+}
+
+// True once `hass.entities` has at least one entry. `CombustionCard` uses
+// this to decide whether a resolution is safe to cache: the entity/device
+// registry collections can still be empty on the very first `hass` write
+// (not yet populated), and a resolution made against an empty registry —
+// e.g. a renamed `entity:` falling through to a malformed string-built
+// guess — must not be frozen in as final. Once the registry has anything
+// in it at all, resolution is considered final for the current config.
+export function hasPopulatedRegistry(hass) {
+  return !!(hass && hass.entities && Object.keys(hass.entities).length);
+}
+
 // Assign every sibling entity to a card role. Each entity is matched against
 // its single most specific suffix across *all* roles (ROLE_SUFFIXES is
 // sorted longest-first, so `.find` returns that one), THEN filtered to
@@ -100,9 +153,9 @@ function siblingEntityIds(hass, deviceId) {
 function assignRoles(siblingIds, kind) {
   const entities = {};
   for (const id of siblingIds) {
-    const best = ROLE_SUFFIXES.find(([, suffix]) => id.endsWith(suffix));
+    const best = ROLE_SUFFIXES.find(([, domain, suffix]) => id.startsWith(domain) && id.endsWith(suffix));
     if (!best) continue;
-    const [role, , roleKind] = best;
+    const [role, , , roleKind] = best;
     if (roleKind !== 'both' && roleKind !== kind) continue;
     if (entities[role] !== undefined) continue;
     entities[role] = id;
@@ -226,7 +279,12 @@ function toCelsius(v, unit) {
 
 class CombustionCard extends HTMLElement {
   static getStubConfig(hass) {
-    const core = Object.keys(hass.states).find((e) => e.endsWith('_core_temperature'));
+    const entities = hass.entities || {};
+    const core = Object.keys(hass.states).find((e) => {
+      if (!e.endsWith('_core_temperature')) return false;
+      const reg = entities[e];
+      return !!reg && reg.platform === 'combustion';
+    });
     return core ? { entity: core } : { serial: '10007dc0' };
   }
 
@@ -261,7 +319,11 @@ class CombustionCard extends HTMLElement {
     this._isGauge = isGauge;
     this._round = this._isGauge && this._config.style !== 'square';
     this._entities = entities;
-    this._resolved = true;
+    // Don't freeze a guess made before the registry arrived — see
+    // hasPopulatedRegistry's doc comment. Leaving `_resolved` false here
+    // means the next `hass` write retries instead of caching a string-built
+    // fallback forever.
+    this._resolved = hasPopulatedRegistry(this._hass);
   }
 
   _resolveSecondary(sec) {
@@ -954,6 +1016,7 @@ class CombustionCardEditor extends HTMLElement {
     // user is typing into it. The entity picker (if present) does need a
     // live hass to look up entities, so push it through directly instead.
     this._hass = hass;
+    this._gaugeDeviceIds = computeGaugeDeviceIds(hass);
     const picker = this.shadowRoot && this.shadowRoot.getElementById('entity-picker');
     if (picker) picker.hass = hass;
   }
@@ -966,20 +1029,13 @@ class CombustionCardEditor extends HTMLElement {
     return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  // Entities selectable from the picker: combustion-platform sensors whose ID
-  // ends `_core_temperature` (probes) or `_zone`/`_temperature` (gauges).
-  // This is what keeps Boosters and Displays from being picked at all — they
-  // have neither suffix. Guard against the same greedy-suffix trap as the
-  // resolver: `_ambient_temperature` etc. also end in `_temperature`.
+  // Thin wrapper around the pure isPickableCombustionEntity — see its doc
+  // comment for what's selectable and why this is a capability check
+  // rather than a denylist. This method only supplies live registry data.
   _pickerFilter(stateObj) {
     const id = stateObj.entity_id;
     const reg = this._hass && this._hass.entities && this._hass.entities[id];
-    if (reg && reg.platform && reg.platform !== 'combustion') return false;
-    if (id.endsWith('_core_temperature') || id.endsWith('_zone')) return true;
-    return id.endsWith('_temperature')
-      && !id.endsWith('_ambient_temperature')
-      && !id.endsWith('_instant_read_temperature')
-      && !id.endsWith('_target_temperature');
+    return isPickableCombustionEntity(id, reg, this._gaugeDeviceIds);
   }
 
   // If ha-entity-picker isn't registered yet (editor rendered very early, or
@@ -1000,10 +1056,15 @@ class CombustionCardEditor extends HTMLElement {
     const cfg = this._config;
     const hasPicker = typeof customElements !== 'undefined' && !!customElements.get('ha-entity-picker');
     if (!hasPicker) this._ensurePickerUpgrade();
+    if (!this._gaugeDeviceIds) this._gaugeDeviceIds = computeGaugeDeviceIds(this._hass);
 
+    // No standalone <label> here: ha-entity-picker draws its own internal
+    // floating label (set via `picker.label` below), and a shadow-DOM
+    // <label for="..."> can't associate with an element inside another
+    // element's shadow root anyway. A second, disagreeing label stacked on
+    // top of it was confusing (seen on the maintainer's live instance).
     const pickerRow = hasPicker ? `
         <div class="row">
-          <label id="entity-picker-label">Probe or gauge</label>
           <div id="entity-picker-slot"></div>
           <span class="hint">Pick the probe or gauge to show. Boosters and Displays aren't selectable here.</span>
         </div>` : '';
@@ -1058,7 +1119,7 @@ class CombustionCardEditor extends HTMLElement {
       picker.id = 'entity-picker';
       picker.hass = this._hass;
       picker.value = cfg.entity || '';
-      picker.label = 'Entity';
+      picker.label = 'Probe or gauge';
       picker.allowCustomEntity = false;
       picker.entityFilter = (stateObj) => this._pickerFilter(stateObj);
       picker.addEventListener('value-changed', (ev) => {
@@ -1075,8 +1136,17 @@ class CombustionCardEditor extends HTMLElement {
 
   _update(key, value) {
     const next = Object.assign({}, this._config);
-    if (value) next[key] = value;
-    else delete next[key];
+    if (value) {
+      next[key] = value;
+      // The picker and the serial field both identify the same device; the
+      // brief wants both controls present, not both populated. Whichever one
+      // the user just set wins outright, so a stale value in the other can't
+      // silently win the resolver's fallback chain later.
+      if (key === 'entity') delete next.serial;
+      if (key === 'serial') delete next.entity;
+    } else {
+      delete next[key];
+    }
     this._config = next;
     this.dispatchEvent(new CustomEvent('config-changed', { detail: { config: next }, bubbles: true, composed: true }));
   }
